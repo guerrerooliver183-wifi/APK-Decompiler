@@ -4,8 +4,7 @@ name: Download, Decompile and Publish APK
 on:
   workflow_dispatch:
   push:
-    branches:
-      - main
+    branches: [main]
 
 permissions:
   contents: read
@@ -20,20 +19,50 @@ jobs:
     timeout-minutes: 45
 
     steps:
+      - name: Checkout workflow repository
+        uses: actions/checkout@v7
+
+      - name: Checkout destination repository
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ secrets.DEST_REPO }}
+          token: ${{ secrets.DEST_TOKEN }}
+          ref: main
+          path: destination
+
+      - name: Check and create destination directories
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for dir in \
+            destination/decompiled \
+            destination/decompiled/jadx \
+            destination/decompiled/apktool
+          do
+            if [ -d "$dir" ]; then
+              echo "Directory exists: $dir"
+            else
+              echo "Creating directory: $dir"
+              mkdir -p "$dir"
+            fi
+          done
+
+          echo "Destination directories are ready."
+
       - name: Set up Java
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "17"
 
-      - name: Install tools
+      - name: Install JADX and Apktool
         shell: bash
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y curl jq unzip
+          sudo apt-get install -y curl jq unzip rsync file
 
-          # Install JADX from its official GitHub release.
           JADX_URL="$(
             curl -fsSL \
               https://api.github.com/repos/skylot/jadx/releases/latest |
@@ -45,12 +74,12 @@ jobs:
           sudo mkdir -p /opt/jadx
           sudo unzip -q /tmp/jadx.zip -d /opt/jadx
 
-          JADX_BIN="$(find /opt/jadx -type f -path '*/bin/jadx' | head -n 1)"
+          JADX_BIN="$(find /opt/jadx -type f \
+            -path '*/bin/jadx' | head -n 1)"
           test -n "$JADX_BIN"
           sudo chmod +x "$JADX_BIN"
           sudo ln -sf "$JADX_BIN" /usr/local/bin/jadx
 
-          # Install Apktool from its official GitHub release.
           APKTOOL_URL="$(
             curl -fsSL \
               https://api.github.com/repos/iBotPeaches/Apktool/releases/latest |
@@ -58,9 +87,7 @@ jobs:
               '[.assets[] | select(.name | test("^apktool_[0-9].*\\.jar$"))][0].browser_download_url'
           )"
 
-          curl -fsSL "$APKTOOL_URL" \
-            -o /tmp/apktool.jar
-
+          curl -fsSL "$APKTOOL_URL" -o /tmp/apktool.jar
           sudo install -m 0644 /tmp/apktool.jar \
             /usr/local/bin/apktool.jar
 
@@ -78,6 +105,7 @@ jobs:
         run: |
           set -euo pipefail
           test -n "$APK_URL"
+
           curl --fail --location --silent --show-error \
             --retry 3 \
             "$APK_URL" \
@@ -88,55 +116,66 @@ jobs:
           sha256sum app.apk
 
       - name: Decompile with JADX
+        shell: bash
         run: |
           set -euo pipefail
           mkdir -p output/jadx
-          jadx --threads-count 2 \
-            -d output/jadx app.apk
+          jadx --threads-count 2 -d output/jadx app.apk
 
       - name: Decode with Apktool
-        run: |
-          set -euo pipefail
-          apktool d --force \
-            -o output/apktool app.apk
-
-      - name: Add metadata
         shell: bash
         run: |
+          set -euo pipefail
+          mkdir -p output/apktool
+          apktool d --force -o output/apktool app.apk
+
+      - name: Replace destination results
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sync_if_populated() {
+            local src="$1"
+            local dst="$2"
+
+            mkdir -p "$dst"
+
+            # find also detects hidden files.
+            # Do not erase old results if the new output is empty.
+            if find "$src" -mindepth 1 -print -quit |
+               grep -q .; then
+              echo "Replacing contents of $dst"
+              rsync -a --delete "$src/" "$dst/"
+            else
+              echo "WARNING: $src is empty; keeping previous results."
+            fi
+          }
+
+          sync_if_populated output/jadx \
+            destination/decompiled/jadx
+
+          sync_if_populated output/apktool \
+            destination/decompiled/apktool
+
           {
-            echo "# APK analysis"
+            echo "# APK decompilation"
             echo
-            echo "- Source: configured APK_URL secret"
+            echo "- Source commit: $GITHUB_SHA"
             echo "- SHA-256: $(sha256sum app.apk | cut -d ' ' -f 1)"
-            echo "- Commit: $GITHUB_SHA"
             echo "- Date (UTC): $(date -u +%FT%TZ)"
-          } > output/README.md
+          } > destination/decompiled/README.md
 
-      - name: Checkout destination repository
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ secrets.DEST_REPO }}
-          token: ${{ secrets.DEST_TOKEN }}
-          ref: main
-          path: destination
-          persist-credentials: true
-
-      - name: Publish results
-        env:
-          TARGET_DIR: destination/decompiled
+      - name: Commit and push results
+        working-directory: destination
         shell: bash
         run: |
           set -euo pipefail
 
-          mkdir -p "$TARGET_DIR"
-          rsync -a --delete output/ "$TARGET_DIR/"
-
-          cd destination
           git config user.name "github-actions[bot]"
           git config user.email \
             "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git add decompiled/
+          git add -A -- decompiled/
 
           if git diff --cached --quiet; then
             echo "No changes to publish."
