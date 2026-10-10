@@ -1,5 +1,5 @@
 
-name: Download, Decompile and Publish APK
+name: Parallel APK Decompilation
 
 on:
   workflow_dispatch:
@@ -10,162 +10,201 @@ permissions:
   contents: read
 
 concurrency:
-  group: decompile-apk
+  group: apk-decompilation
   cancel-in-progress: false
 
 jobs:
-  decompile:
+  jadx:
+    name: Decompile with JADX
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
     steps:
-      - name: Checkout workflow repository
-        uses: actions/checkout@v7
-
-      - name: Checkout destination repository
-        uses: actions/checkout@v7
-        with:
-          repository: ${{ secrets.DEST_REPO }}
-          token: ${{ secrets.DEST_TOKEN }}
-          ref: main
-          path: destination
-
-      - name: Check and create destination directories
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          for dir in \
-            destination/decompiled \
-            destination/decompiled/jadx \
-            destination/decompiled/apktool
-          do
-            if [ -d "$dir" ]; then
-              echo "Directory exists: $dir"
-            else
-              echo "Creating directory: $dir"
-              mkdir -p "$dir"
-            fi
-          done
-
-          echo "Destination directories are ready."
-
       - name: Set up Java
-        uses: actions/setup-java@v5
+        uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
 
-      - name: Install JADX and Apktool
+      - name: Install JADX
         shell: bash
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y curl jq unzip rsync file
+          sudo apt-get install -y curl jq unzip file
 
-          JADX_URL="$(
-            curl -fsSL \
-              https://api.github.com/repos/skylot/jadx/releases/latest |
-            jq -er \
-              '[.assets[] | select(.name | test("^jadx-.*\\.zip$"))][0].browser_download_url'
+          URL="$(
+            curl -fsSL https://api.github.com/repos/skylot/jadx/releases/latest |
+            jq -er '[.assets[] |
+              select(.name | test("^jadx-.*\\.zip$"))][0].browser_download_url'
           )"
 
-          curl -fsSL "$JADX_URL" -o /tmp/jadx.zip
+          curl -fsSL "$URL" -o /tmp/jadx.zip
           sudo mkdir -p /opt/jadx
           sudo unzip -q /tmp/jadx.zip -d /opt/jadx
 
-          JADX_BIN="$(find /opt/jadx -type f \
+          BIN="$(find /opt/jadx -type f \
             -path '*/bin/jadx' | head -n 1)"
-          test -n "$JADX_BIN"
-          sudo chmod +x "$JADX_BIN"
-          sudo ln -sf "$JADX_BIN" /usr/local/bin/jadx
+          test -n "$BIN"
+          sudo chmod +x "$BIN"
+          sudo ln -sf "$BIN" /usr/local/bin/jadx
+          jadx --version
 
-          APKTOOL_URL="$(
-            curl -fsSL \
-              https://api.github.com/repos/iBotPeaches/Apktool/releases/latest |
-            jq -er \
-              '[.assets[] | select(.name | test("^apktool_[0-9].*\\.jar$"))][0].browser_download_url'
+      - name: Download APK
+        env:
+          APK_URL: ${{ secrets.APK_URL }}
+        run: |
+          set -euo pipefail
+          test -n "$APK_URL"
+          curl -fLsS --retry 3 "$APK_URL" -o app.apk
+          test -s app.apk
+          file app.apk
+
+      - name: Run JADX
+        shell: bash
+        run: |
+          set -uo pipefail
+          mkdir -p output/jadx
+
+          set +e
+          jadx --threads-count 2 -d output/jadx app.apk
+          STATUS=$?
+          set -e
+
+          echo "JADX exit code: $STATUS"
+
+          if [ "$STATUS" -ne 0 ] && [ "$STATUS" -ne 3 ]; then
+            echo "::error::JADX failed."
+            exit "$STATUS"
+          fi
+
+          if ! find output/jadx -type f -print -quit | grep -q .; then
+            echo "::error::JADX produced no files."
+            exit 1
+          fi
+
+          if [ "$STATUS" -eq 3 ]; then
+            echo "::warning::JADX produced partial output."
+          fi
+
+      - name: Upload JADX output
+        uses: actions/upload-artifact@v4
+        with:
+          name: jadx-output
+          path: output/jadx/
+          if-no-files-found: error
+          retention-days: 3
+
+  apktool:
+    name: Decode with Apktool
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install Apktool
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y curl jq file
+
+          URL="$(
+            curl -fsSL https://api.github.com/repos/iBotPeaches/Apktool/releases/latest |
+            jq -er '[.assets[] |
+              select(.name | test("^apktool_[0-9].*\\.jar$"))][0].browser_download_url'
           )"
 
-          curl -fsSL "$APKTOOL_URL" -o /tmp/apktool.jar
+          curl -fsSL "$URL" -o /tmp/apktool.jar
           sudo install -m 0644 /tmp/apktool.jar \
             /usr/local/bin/apktool.jar
 
           printf '#!/bin/sh\nexec java -jar /usr/local/bin/apktool.jar "$@"\n' \
             | sudo tee /usr/local/bin/apktool >/dev/null
           sudo chmod +x /usr/local/bin/apktool
-
-          jadx --version
           apktool --version
 
       - name: Download APK
         env:
           APK_URL: ${{ secrets.APK_URL }}
-        shell: bash
         run: |
           set -euo pipefail
           test -n "$APK_URL"
-
-          curl --fail --location --silent --show-error \
-            --retry 3 \
-            "$APK_URL" \
-            --output app.apk
-
+          curl -fLsS --retry 3 "$APK_URL" -o app.apk
           test -s app.apk
           file app.apk
-          sha256sum app.apk
 
-      - name: Decompile with JADX
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p output/jadx
-          jadx --threads-count 2 -d output/jadx app.apk
-
-      - name: Decode with Apktool
-        shell: bash
+      - name: Decode APK
         run: |
           set -euo pipefail
           mkdir -p output/apktool
           apktool d --force -o output/apktool app.apk
 
-      - name: Replace destination results
+          if ! find output/apktool -type f -print -quit | grep -q .; then
+            echo "::error::Apktool produced no files."
+            exit 1
+          fi
+
+      - name: Upload Apktool output
+        uses: actions/upload-artifact@v4
+        with:
+          name: apktool-output
+          path: output/apktool/
+          if-no-files-found: error
+          retention-days: 3
+
+  publish:
+    name: Publish both results
+    runs-on: ubuntu-latest
+    needs: [jadx, apktool]
+    timeout-minutes: 15
+
+    steps:
+      - name: Download JADX result
+        uses: actions/download-artifact@v4
+        with:
+          name: jadx-output
+          path: output/jadx
+
+      - name: Download Apktool result
+        uses: actions/download-artifact@v4
+        with:
+          name: apktool-output
+          path: output/apktool
+
+      - name: Checkout destination repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.DEST_REPO }}
+          token: ${{ secrets.DEST_TOKEN }}
+          ref: main
+          path: destination
+
+      - name: Prepare and replace results
         shell: bash
         run: |
           set -euo pipefail
 
-          sync_if_populated() {
-            local src="$1"
-            local dst="$2"
+          for dir in jadx apktool; do
+            src="output/$dir"
+            dst="destination/decompiled/$dir"
 
             mkdir -p "$dst"
 
-            # find also detects hidden files.
-            # Do not erase old results if the new output is empty.
-            if find "$src" -mindepth 1 -print -quit |
-               grep -q .; then
-              echo "Replacing contents of $dst"
+            if find "$src" -type f -print -quit | grep -q .; then
+              echo "Replacing $dst"
               rsync -a --delete "$src/" "$dst/"
             else
-              echo "WARNING: $src is empty; keeping previous results."
+              echo "::warning::No files in $src; keeping old results."
             fi
-          }
+          done
 
-          sync_if_populated output/jadx \
-            destination/decompiled/jadx
-
-          sync_if_populated output/apktool \
-            destination/decompiled/apktool
-
-          {
-            echo "# APK decompilation"
-            echo
-            echo "- Source commit: $GITHUB_SHA"
-            echo "- SHA-256: $(sha256sum app.apk | cut -d ' ' -f 1)"
-            echo "- Date (UTC): $(date -u +%FT%TZ)"
-          } > destination/decompiled/README.md
-
-      - name: Commit and push results
+      - name: Commit and push
         working-directory: destination
         shell: bash
         run: |
