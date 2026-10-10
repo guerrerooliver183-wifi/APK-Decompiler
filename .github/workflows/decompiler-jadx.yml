@@ -1,0 +1,139 @@
+
+name: Download, Decompile and Publish APK
+
+on:
+  workflow_dispatch:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: decompile-apk
+  cancel-in-progress: false
+
+jobs:
+  decompile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Download APK
+        env:
+          APK_URL: ${{ secrets.APK_URL }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "$APK_URL" ]]; then
+            echo "Missing APK_URL secret"
+            exit 1
+          fi
+
+          curl --fail --location --silent --show-error \
+            --retry 3 \
+            "$APK_URL" \
+            --output "$RUNNER_TEMP/app.apk"
+
+          if ! unzip -t "$RUNNER_TEMP/app.apk" >/dev/null; then
+            echo "Downloaded file is not a valid APK/ZIP"
+            exit 1
+          fi
+
+      - name: Download JADX
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          API_URL="https://api.github.com/repos/skylot/jadx/releases/latest"
+
+          curl --fail --location --silent --show-error \
+            "$API_URL" \
+            --output "$RUNNER_TEMP/jadx-release.json"
+
+          JADX_URL="$(jq -r \
+            '[.assets[] | select(.name | test("^jadx-.*\\.zip$"))]
+             | first | .browser_download_url // empty' \
+            "$RUNNER_TEMP/jadx-release.json")"
+
+          if [[ -z "$JADX_URL" ]]; then
+            echo "Could not find the JADX release ZIP"
+            exit 1
+          fi
+
+          curl --fail --location --silent --show-error \
+            "$JADX_URL" \
+            --output "$RUNNER_TEMP/jadx.zip"
+
+          mkdir -p "$RUNNER_TEMP/jadx"
+          unzip -q "$RUNNER_TEMP/jadx.zip" \
+            -d "$RUNNER_TEMP/jadx"
+
+          JADX_BIN="$(find "$RUNNER_TEMP/jadx" \
+            -type f -path '*/bin/jadx' -print -quit)"
+
+          if [[ -z "$JADX_BIN" ]]; then
+            echo "JADX executable not found"
+            exit 1
+          fi
+
+          chmod +x "$JADX_BIN"
+          echo "JADX_BIN=$JADX_BIN" >> "$GITHUB_ENV"
+
+      - name: Checkout destination repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.DEST_REPO }}
+          token: ${{ secrets.DEST_TOKEN }}
+          ref: main
+          path: destination
+          persist-credentials: true
+
+      - name: Decompile APK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf destination/decompiled
+          mkdir -p destination/decompiled
+
+          "$JADX_BIN" \
+            --no-res \
+            -d destination/decompiled \
+            "$RUNNER_TEMP/app.apk"
+
+          cat > destination/decompiled/README.md <<'EOF'
+          # Decompiled APK
+
+          Generated automatically with JADX by GitHub Actions.
+          This is reconstructed source code, not the original project.
+          EOF
+
+      - name: Commit and push changes
+        working-directory: destination
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add -A decompiled/
+
+          if git diff --cached --quiet; then
+            echo "No changes to publish"
+            exit 0
+          fi
+
+          git commit -m "Update decompiled APK from ${SOURCE_SHA:0:7}"
+          git push origin HEAD:main
